@@ -3,14 +3,19 @@ name: RDP
 on:
   workflow_dispatch:
 
+env:
+  # Fixed password - change this to your preferred password
+  RDP_PASSWORD: "YourSecurePassword123!"
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -18,65 +23,88 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Set Default User Password
+      - name: Create RDP User with Fixed Password
         run: |
-          # Default user ka password set karo
-          $password = "Runner@123456!"
+          $password = "$env:RDP_PASSWORD"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          # Default user ka password change karo
-          Set-LocalUser -Name "runneradmin" -Password $securePass -PasswordNeverExpires:$true
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
-          
-          Write-Host "Password set for runneradmin"
+
+          # Remove existing user if exists to avoid errors
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP" -Confirm:$false
+          }
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes
-          
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
               $retries++
           }
-          
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned"
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Show RDP Details
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host "`n========================================"
-          Write-Host "RDP ACCESS DETAILS"
-          Write-Host "========================================"
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: runneradmin"
-          Write-Host "Password: Runner@123456!"
-          Write-Host "========================================`n"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-      - name: Keep Alive
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
         run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
- 
           }
